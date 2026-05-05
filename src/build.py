@@ -1650,6 +1650,14 @@ COSMETIC_JS_TEMPLATE = """\
     '.advertisement','.advertising','.advertise',
     'iframe[src*="doubleclick.net"]','iframe[src*="googlesyndication.com"]',
     'iframe[src*="adnxs.com"]','iframe[src*="pubmatic.com"]',
+    // YouTube search sponsored results (cosmetic.js runs even on YT)
+    'ytd-search-pyv-renderer','ytd-promoted-sparkles-web-renderer',
+    'ytd-promoted-sparkles-text-search-renderer','ytd-display-ad-renderer',
+    'ytd-banner-promo-renderer','ytd-statement-banner-renderer',
+    '#masthead-ad',
+    // Reddit sponsored posts (new shreddit UI + old Reddit)
+    'shreddit-ad-post','.promotedlink',
+    '[data-testid="post-container"][data-promoted="true"]',
     EASYLIST_SELECTORS
   ];
 

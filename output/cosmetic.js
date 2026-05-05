@@ -79,6 +79,12 @@
     '.advertisement','.advertising','.advertise',
     'iframe[src*="doubleclick.net"]','iframe[src*="googlesyndication.com"]',
     'iframe[src*="adnxs.com"]','iframe[src*="pubmatic.com"]',
+    'ytd-search-pyv-renderer','ytd-promoted-sparkles-web-renderer',
+    'ytd-promoted-sparkles-text-search-renderer','ytd-display-ad-renderer',
+    'ytd-banner-promo-renderer','ytd-statement-banner-renderer',
+    '#masthead-ad',
+    'shreddit-ad-post','.promotedlink',
+    '[data-testid="post-container"][data-promoted="true"]',
     
   ];
 
