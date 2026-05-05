@@ -11,8 +11,127 @@ This guide covers wiring every output file from the build pipeline into a WKWebV
 | `output/adblock.json` | WKContentRuleList — blocks ad-network requests |
 | `output/trackers.json` | WKContentRuleList — blocks tracker/analytics requests |
 | `output/cosmetic.js` | WKUserScript — CSS hiding + anti-adblock API stubs |
-| `output/tracker_stubs.js` | WKUserScript — silently stubs tracker JS APIs | 
-| `output/ytadblock.js` | WKUserScript — YouTube ad blocker | 
+| `output/tracker_stubs.js` | WKUserScript — silently stubs tracker JS APIs |
+| `output/ytadblock.js` | WKUserScript — YouTube ad blocker |
+| `output/block_sources.json` | Domain → filter-list mapping for blocked-URL notifications |
+
+---
+
+## Blocked URL notification page ⚠️ Requires browser-side implementation
+
+`output/block_sources.json` maps every blocked domain to the human-readable
+filter list(s) that block it (e.g. `"doubleclick.net": ["EasyList", "Peter Lowe's Ad and tracking server list"]`).
+
+The **block page UI must be implemented in your browser app** — the build pipeline
+only provides the data file.  A complete reference implementation is in
+`TestApp/Sources/EmeraldTestBrowser/main.swift`.  The key pieces are:
+
+### 1. Load the mapping at startup
+
+```swift
+let path = Bundle.main.url(forResource: "block_sources", withExtension: "json")!
+let data = try! Data(contentsOf: path)
+let blockSources = try! JSONDecoder().decode([String: [String]].self, from: data)
+```
+
+### 2. Register a script message handler for "Proceed anyway"
+
+```swift
+// In your WKWebViewConfiguration setup:
+config.userContentController.add(self, name: "proceedToURL")
+```
+
+### 3. Implement `decidePolicyFor` in your `WKNavigationDelegate`
+
+```swift
+// Hosts the user chose to visit despite being blocked (session-only)
+var bypassedHosts: Set<String> = []
+
+func webView(_ webView: WKWebView,
+             decidePolicyFor action: WKNavigationAction,
+             decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
+    guard action.targetFrame?.isMainFrame == true,
+          let url  = action.request.url,
+          let host = url.host else { decisionHandler(.allow); return }
+
+    if bypassedHosts.contains(host.lowercased()) { decisionHandler(.allow); return }
+
+    guard let lists = findBlockLists(for: host, in: blockSources) else {
+        decisionHandler(.allow); return
+    }
+    decisionHandler(.cancel)
+    showBlockPage(url: url, lists: lists, in: webView)
+}
+
+/// Walk from the full hostname up to the eTLD+1 looking for a match.
+func findBlockLists(for host: String, in sources: [String: [String]]) -> [String]? {
+    var parts = host.lowercased().components(separatedBy: ".")
+    while parts.count >= 2 {
+        if let lists = sources[parts.joined(separator: ".")] { return lists }
+        parts.removeFirst()
+    }
+    return nil
+}
+```
+
+### 4. Render the block page HTML
+
+```swift
+func showBlockPage(url: URL, lists: [String], in webView: WKWebView) {
+    let safeURL = url.absoluteString
+        .replacingOccurrences(of: "&", with: "&amp;")
+        .replacingOccurrences(of: "<", with: "&lt;")
+        .replacingOccurrences(of: "\"", with: "&quot;")
+    let items = lists.map { "<li>\($0)</li>" }.joined(separator: "\n")
+    let html = """
+    <!DOCTYPE html><html><head><meta charset="utf-8">
+    <title>Page Blocked — Emerald</title>
+    <style>
+    body{font-family:-apple-system,sans-serif;background:#1a1a2e;color:#eee;
+         display:flex;align-items:center;justify-content:center;min-height:100vh}
+    .card{background:#16213e;border:1px solid #0f3460;border-radius:12px;
+          max-width:600px;width:90%;padding:2rem;text-align:center}
+    h1{color:#e94560;margin:.5rem 0 1rem}
+    .url{font-family:monospace;background:#0f3460;padding:.6rem;border-radius:6px;
+         word-break:break-all;color:#a8d8ea;margin-bottom:1rem}
+    ul{list-style:none;text-align:left}
+    li{background:#0f3460;border-left:3px solid #e94560;padding:.4rem .8rem;
+       margin:.3rem 0;border-radius:0 4px 4px 0}
+    .proceed{margin-top:1rem;padding:.5rem 1.2rem;background:none;
+             border:1px solid #445;border-radius:6px;color:#667;cursor:pointer}
+    .proceed:hover{border-color:#e94560;color:#e94560}
+    </style></head><body>
+    <div class="card">
+      <div style="font-size:3rem">🛡</div>
+      <h1>Page Blocked by Emerald</h1>
+      <div class="url">\(safeURL)</div>
+      <p>Appears in:</p><ul>\(items)</ul>
+      <button class="proceed"
+        onclick="window.webkit.messageHandlers.proceedToURL.postMessage('\(url.absoluteString)')">
+        Proceed anyway
+      </button>
+    </div></body></html>
+    """
+    webView.loadHTMLString(html, baseURL: nil)
+}
+```
+
+### 5. Handle the "Proceed anyway" message
+
+```swift
+// WKScriptMessageHandler
+func userContentController(_ ucc: WKUserContentController,
+                            didReceive message: WKScriptMessage) {
+    guard message.name == "proceedToURL",
+          let urlString = message.body as? String,
+          let url = URL(string: urlString),
+          let host = url.host else { return }
+    bypassedHosts.insert(host.lowercased())   // allow for rest of session
+    webView.load(URLRequest(url: url))
+}
+```
+
+The bypass is **session-only** — it clears when the browser restarts, so the block page reappears on the next launch.  If you want persistence, save `bypassedHosts` to `UserDefaults`.
 
 ---
 

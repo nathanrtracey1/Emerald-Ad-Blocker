@@ -72,7 +72,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 // Browser window
 // ---------------------------------------------------------------------------
 
-class BrowserWindowController: NSWindowController, WKNavigationDelegate, WKUIDelegate {
+class BrowserWindowController: NSWindowController, WKNavigationDelegate, WKUIDelegate, WKScriptMessageHandler {
 
     private let wkConfig  = WKWebViewConfiguration()
     private var webView:   WKWebView!
@@ -86,6 +86,9 @@ class BrowserWindowController: NSWindowController, WKNavigationDelegate, WKUIDel
 
     // domain → [filter list display names], loaded from output/block_sources.json
     private var blockSources: [String: [String]] = [:]
+
+    // Hosts the user explicitly chose to visit despite being blocked (session-only)
+    private var bypassedHosts: Set<String> = []
 
     // -----------------------------------------------------------------------
     init() {
@@ -233,6 +236,9 @@ class BrowserWindowController: NSWindowController, WKNavigationDelegate, WKUIDel
             print("[TestBrowser] ⚠ Could not load block_sources.json")
         }
 
+        // Register handler so the block page can send "proceed" messages back
+        wkConfig.userContentController.add(self, name: "proceedToURL")
+
         let ucc = wkConfig.userContentController
 
         // ── WKUserScripts (document_start, same order as Emerald) ─────────────
@@ -357,10 +363,12 @@ class BrowserWindowController: NSWindowController, WKNavigationDelegate, WKUIDel
     }
 
     private func showBlockPage(url: URL, lists: [String]) {
-        let urlString = url.absoluteString
+        let rawURL = url.absoluteString
+        let safeURL = rawURL
             .replacingOccurrences(of: "&", with: "&amp;")
             .replacingOccurrences(of: "<", with: "&lt;")
             .replacingOccurrences(of: ">", with: "&gt;")
+            .replacingOccurrences(of: "\"", with: "&quot;")
         let listItems = lists.map { "<li>\($0)</li>" }.joined(separator: "\n            ")
         let html = """
         <!DOCTYPE html>
@@ -386,6 +394,10 @@ class BrowserWindowController: NSWindowController, WKNavigationDelegate, WKUIDel
         ul li{background:#0f3460;border-left:3px solid #e94560;padding:.5rem 1rem;
               margin:.35rem 0;text-align:left;border-radius:0 6px 6px 0;
               font-size:.88rem;color:#ccc}
+        .proceed{display:inline-block;margin-top:.5rem;padding:.55rem 1.4rem;
+                 background:transparent;border:1px solid #445;border-radius:6px;
+                 color:#667;font-size:.8rem;cursor:pointer;transition:all .15s}
+        .proceed:hover{border-color:#e94560;color:#e94560}
         .brand{font-size:.75rem;color:#445;margin-top:1.5rem}
         </style>
         </head>
@@ -393,11 +405,14 @@ class BrowserWindowController: NSWindowController, WKNavigationDelegate, WKUIDel
         <div class="card">
           <div class="shield">🛡</div>
           <h1>Page Blocked by Emerald</h1>
-          <div class="blocked-url">\(urlString)</div>
+          <div class="blocked-url">\(safeURL)</div>
           <p>Emerald Ad Blocker has prevented this page from loading because it appears in:</p>
           <ul>
             \(listItems)
           </ul>
+          <button class="proceed" onclick="window.webkit.messageHandlers.proceedToURL.postMessage('\(rawURL)')">
+            Proceed anyway
+          </button>
           <div class="brand">Emerald Ad Blocker</div>
         </div>
         </body>
@@ -417,13 +432,32 @@ class BrowserWindowController: NSWindowController, WKNavigationDelegate, WKUIDel
         // a uBlock Origin-style block page instead of a generic error.
         guard navigationAction.targetFrame?.isMainFrame == true,
               let url = navigationAction.request.url,
-              let host = url.host,
-              let lists = findBlockLists(for: host) else {
+              let host = url.host else {
+            decisionHandler(.allow)
+            return
+        }
+        // User already chose to proceed past the block page for this host
+        if bypassedHosts.contains(host.lowercased()) {
+            decisionHandler(.allow)
+            return
+        }
+        guard let lists = findBlockLists(for: host) else {
             decisionHandler(.allow)
             return
         }
         decisionHandler(.cancel)
         showBlockPage(url: url, lists: lists)
+    }
+
+    // WKScriptMessageHandler — receives "proceed" messages from the block page
+    func userContentController(_ ucc: WKUserContentController,
+                               didReceive message: WKScriptMessage) {
+        guard message.name == "proceedToURL",
+              let urlString = message.body as? String,
+              let url = URL(string: urlString),
+              let host = url.host else { return }
+        bypassedHosts.insert(host.lowercased())
+        webView.load(URLRequest(url: url))
     }
 
     func webView(_ webView: WKWebView, didStartProvisionalNavigation _: WKNavigation!) {
