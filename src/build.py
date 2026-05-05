@@ -58,6 +58,24 @@ UPSTREAM_LISTS: dict[str, str] = {
     "fanboy_annoyances": "https://secure.fanboy.co.nz/fanboy-annoyance.txt",
 }
 
+# Human-readable display names for each upstream list (used in block notifications)
+LIST_DISPLAY_NAMES: dict[str, str] = {
+    "easylist":          "EasyList",
+    "easyprivacy":       "EasyPrivacy",
+    "peter_lowe":        "Peter Lowe's Ad and tracking server list",
+    "ublock":            "uBlock filters",
+    "ublock_annoyances": "uBlock filters – Annoyances",
+    "ublock_privacy":    "uBlock filters – Privacy",
+    "ublock_unbreak":    "uBlock filters – Unbreak",
+    "fanboy_annoyances": "Fanboy's Annoyance List",
+}
+
+# Regex for simple domain-anchor patterns: ||domain.tld^ (optional $options)
+_SIMPLE_DOMAIN_RE = re.compile(
+    r"^\|\|([a-z0-9][a-z0-9\-]*(?:\.[a-z0-9][a-z0-9\-]*)+)\^(?:\$[^|]*)?$",
+    re.IGNORECASE,
+)
+
 # ---------------------------------------------------------------------------
 # CDN / false-positive protection
 # ---------------------------------------------------------------------------
@@ -1795,6 +1813,55 @@ def write_rules_auto_split(
 
 
 # ---------------------------------------------------------------------------
+# Block-source mapping — domain → [filter list display names]
+# ---------------------------------------------------------------------------
+
+def extract_block_sources(raw: dict[str, str]) -> dict[str, list[str]]:
+    """
+    Scan each upstream list for simple ||domain.tld^ patterns and build a
+    mapping from domain to the human-readable list name(s) that block it.
+    Only pure domain anchors (no wildcards, no path components) are included
+    so the result stays concise and lookups are O(1).
+    """
+    sources: dict[str, list[str]] = defaultdict(list)
+
+    for name, text in raw.items():
+        if not text:
+            continue
+        display = LIST_DISPLAY_NAMES.get(name, name)
+        seen: set[str] = set()
+        for line in text.splitlines():
+            line = line.strip()
+            if not line or line.startswith("!") or line.startswith("#"):
+                continue
+            if line.startswith("@@") or "##" in line:
+                continue
+            m = _SIMPLE_DOMAIN_RE.match(line)
+            if m:
+                domain = m.group(1).lower()
+                if domain not in seen:
+                    seen.add(domain)
+                    if display not in sources[domain]:
+                        sources[domain].append(display)
+
+    return dict(sources)
+
+
+# Exception rules that must appear after all block rules in trackers.json so
+# that ignore-previous-rules cancels any upstream blocks on these endpoints.
+# GitHub's /_private/browser/ endpoints are internal telemetry beacons; some
+# upstream lists block them, which can interfere with GitHub's page-load logic.
+GITHUB_INTERNAL_SAFETY_NET: list[dict] = [
+    {
+        "trigger": {
+            "url-filter": "^[a-z]+://([a-z0-9.-]+\\.)?github\\.com/_private/browser/",
+        },
+        "action": {"type": "ignore-previous-rules"},
+    }
+]
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -1878,7 +1945,7 @@ def main() -> None:
     # (see COSMETIC_EXCLUDE_DOMAINS). Network-level ad/tracker blocking still
     # applies on those domains — only element hiding is skipped.
     adblock_merged = dedup(fixed_adblock + adblock_blocks + native_cosmetic) + YOUTUBE_SAFETY_NET
-    trackers_merged = dedup(fixed_trackers + tracker_blocks) + YOUTUBE_SAFETY_NET
+    trackers_merged = dedup(fixed_trackers + tracker_blocks) + YOUTUBE_SAFETY_NET + GITHUB_INTERNAL_SAFETY_NET
     exceptions_merged = dedup(all_exceptions)
 
     total = len(adblock_merged) + len(trackers_merged) + len(exceptions_merged)
@@ -1966,6 +2033,15 @@ def main() -> None:
     with open(removeparam_out, "w") as f:
         json.dump(removeparam_rules, f, separators=(",", ":"))
     print(f"  Wrote {removeparam_out.relative_to(ROOT)} ({len(removeparam_rules):,} rules)")
+
+    # ── Build block_sources.json (domain → filter list names for block UI) ───────
+    print("\n=== Building block_sources.json ===")
+    block_sources = extract_block_sources(raw)
+    block_sources_out = OUTPUT_DIR / "block_sources.json"
+    with open(block_sources_out, "w") as f:
+        json.dump(block_sources, f, separators=(",", ":"))
+    size_kb = block_sources_out.stat().st_size / 1024
+    print(f"  Wrote {block_sources_out.relative_to(ROOT)} ({len(block_sources):,} domains, {size_kb:.0f} KB)")
 
     print("\n=== Done ✓ ===\n")
 

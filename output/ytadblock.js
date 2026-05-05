@@ -476,6 +476,7 @@
       init_disable_play_on_hover();
       init_disable_end_cards();
       init_interruptions_remover();
+      init_enforcement_wall_remover();
       init_miniplayer_button();
 
       const hoverToggleListener = (key, _oldValue, newValue) => {
@@ -1608,7 +1609,7 @@
         "abs:playerAds=- $exist",
         "abs:adSlots=- $exist",
         "abs:adPlacements=- $exist",
-        'abs:auxiliaryUi.messageRenderers.bkaEnforcementMessageViewModel.isVisible=json("true") $exist',
+        "abs:auxiliaryUi.messageRenderers.bkaEnforcementMessageViewModel=- $exist",
         "abs:adBreakHeartbeatParams=- $exist",
         "abs:messages[*]=- /.mealbarPromoRenderer$exist",
       ],
@@ -3565,6 +3566,44 @@ ytd-video-secondary-info-renderer .yt-chip-cloud-chip-renderer,
         attributes: false,
         characterData: false,
       });
+    } catch (e) {}
+  }
+
+  function init_enforcement_wall_remover() {
+    // YouTube's ad-blocker enforcement wall elements. When present, the player
+    // is paused and a modal is shown. We remove the modal and resume playback.
+    const ENFORCEMENT_SELECTORS = [
+      "ytd-enforcement-message-view-model",
+      "ytd-enforcement-interstitial-view-model",
+      "tp-yt-paper-dialog.ytd-enforcement-message-view-model",
+    ].join(",");
+
+    const dismiss = () => {
+      try {
+        const walls = unsafeWindow.document.querySelectorAll(ENFORCEMENT_SELECTORS);
+        if (walls.length === 0) return;
+        walls.forEach((el) => el.remove());
+        // Re-enable the video if the player paused it for the wall
+        const video = unsafeWindow.document.querySelector("video");
+        if (video && video.paused) {
+          video.play().catch(() => {});
+        }
+        // Remove the "ad-showing" class the player adds when enforcing
+        const player = unsafeWindow.document.querySelector(".html5-video-player");
+        if (player) {
+          player.classList.remove("ad-showing", "ad-interrupting");
+        }
+      } catch (e) {}
+    };
+
+    setInterval(dismiss, 1000);
+    try {
+      const obs = new MutationObserver((mutations) => {
+        for (const m of mutations) {
+          if (m.addedNodes.length) { dismiss(); break; }
+        }
+      });
+      obs.observe(unsafeWindow.document.documentElement, { childList: true, subtree: true });
     } catch (e) {}
   }
 

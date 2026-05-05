@@ -84,6 +84,9 @@ class BrowserWindowController: NSWindowController, WKNavigationDelegate, WKUIDel
     private var rulesFailed   = 0
     private var pendingCompile = 0
 
+    // domain → [filter list display names], loaded from output/block_sources.json
+    private var blockSources: [String: [String]] = [:]
+
     // -----------------------------------------------------------------------
     init() {
         let win = NSWindow(
@@ -220,6 +223,16 @@ class BrowserWindowController: NSWindowController, WKNavigationDelegate, WKUIDel
     // -----------------------------------------------------------------------
 
     private func loadAdblocker() {
+        // Load domain → [filter list] mapping for blocked URL notifications
+        let blockSourcesPath = ROOT.appendingPathComponent("output/block_sources.json")
+        if let data = try? Data(contentsOf: blockSourcesPath),
+           let dict = try? JSONSerialization.jsonObject(with: data) as? [String: [String]] {
+            blockSources = dict
+            print("[TestBrowser] Loaded block_sources.json (\(blockSources.count) domains)")
+        } else {
+            print("[TestBrowser] ⚠ Could not load block_sources.json")
+        }
+
         let ucc = wkConfig.userContentController
 
         // ── WKUserScripts (document_start, same order as Emerald) ─────────────
@@ -329,8 +342,89 @@ class BrowserWindowController: NSWindowController, WKNavigationDelegate, WKUIDel
     }
 
     // -----------------------------------------------------------------------
+    // MARK: Block-page helpers
+    // -----------------------------------------------------------------------
+
+    /// Check a hostname (and its parent domains) against the block-sources map.
+    private func findBlockLists(for host: String) -> [String]? {
+        var parts = host.lowercased().components(separatedBy: ".")
+        while parts.count >= 2 {
+            let domain = parts.joined(separator: ".")
+            if let lists = blockSources[domain] { return lists }
+            parts.removeFirst()
+        }
+        return nil
+    }
+
+    private func showBlockPage(url: URL, lists: [String]) {
+        let urlString = url.absoluteString
+            .replacingOccurrences(of: "&", with: "&amp;")
+            .replacingOccurrences(of: "<", with: "&lt;")
+            .replacingOccurrences(of: ">", with: "&gt;")
+        let listItems = lists.map { "<li>\($0)</li>" }.joined(separator: "\n            ")
+        let html = """
+        <!DOCTYPE html>
+        <html>
+        <head>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width">
+        <title>Page Blocked — Emerald</title>
+        <style>
+        *{box-sizing:border-box;margin:0;padding:0}
+        body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+             background:#1a1a2e;color:#eee;display:flex;align-items:center;
+             justify-content:center;min-height:100vh;padding:2rem}
+        .card{background:#16213e;border:1px solid #0f3460;border-radius:12px;
+              max-width:620px;width:100%;padding:2.5rem;text-align:center}
+        .shield{font-size:3.5rem;margin-bottom:1rem}
+        h1{font-size:1.4rem;color:#e94560;margin-bottom:1rem}
+        .blocked-url{font-family:monospace;font-size:.85rem;background:#0f3460;
+                     padding:.75rem 1rem;border-radius:6px;word-break:break-all;
+                     color:#a8d8ea;margin-bottom:1.5rem;text-align:left}
+        p{color:#aaa;margin-bottom:1rem;font-size:.9rem}
+        ul{list-style:none;margin-bottom:1.5rem}
+        ul li{background:#0f3460;border-left:3px solid #e94560;padding:.5rem 1rem;
+              margin:.35rem 0;text-align:left;border-radius:0 6px 6px 0;
+              font-size:.88rem;color:#ccc}
+        .brand{font-size:.75rem;color:#445;margin-top:1.5rem}
+        </style>
+        </head>
+        <body>
+        <div class="card">
+          <div class="shield">🛡</div>
+          <h1>Page Blocked by Emerald</h1>
+          <div class="blocked-url">\(urlString)</div>
+          <p>Emerald Ad Blocker has prevented this page from loading because it appears in:</p>
+          <ul>
+            \(listItems)
+          </ul>
+          <div class="brand">Emerald Ad Blocker</div>
+        </div>
+        </body>
+        </html>
+        """
+        webView.loadHTMLString(html, baseURL: nil)
+        urlField.stringValue = url.absoluteString
+    }
+
+    // -----------------------------------------------------------------------
     // MARK: WKNavigationDelegate
     // -----------------------------------------------------------------------
+
+    func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction,
+                 decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
+        // Intercept main-frame navigations to known blocked domains and show
+        // a uBlock Origin-style block page instead of a generic error.
+        guard navigationAction.targetFrame?.isMainFrame == true,
+              let url = navigationAction.request.url,
+              let host = url.host,
+              let lists = findBlockLists(for: host) else {
+            decisionHandler(.allow)
+            return
+        }
+        decisionHandler(.cancel)
+        showBlockPage(url: url, lists: lists)
+    }
 
     func webView(_ webView: WKWebView, didStartProvisionalNavigation _: WKNavigation!) {
         spinner.isHidden = false; spinner.startAnimation(nil)
