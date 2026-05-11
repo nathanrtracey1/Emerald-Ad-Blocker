@@ -639,9 +639,7 @@
         const origin_ua = navigator.userAgent;
         define_property_hook(navigator, "userAgent", {
           get: function () {
-            return browser_info.isMobile || browser_info.name === "Chrome"
-              ? origin_ua
-              : "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36";
+            return origin_ua;
           },
         });
         if (unsafeWindow.ytcfg) {
