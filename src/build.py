@@ -10,6 +10,8 @@ Changes from v2:
   - WebSocket/WebRTC blocking → output/websocket_block.js
   - Improved MutationObserver performance in cosmetic.js
   - :has-text() procedural cosmetic filter support
+  - Google Workspace exception rules (v3.1)
+  - Nativize helper for wrapped functions (v3.1)
 
 Output
 ------
@@ -127,7 +129,6 @@ def fetch_list(name: str, url: str) -> str:
         with urllib.request.urlopen(req, context=_ssl_context(), timeout=45) as resp:
             text = resp.read().decode("utf-8", errors="replace")
     except urllib.error.URLError as exc:
-        # Network failed — fall back to cache if available
         if cache.exists():
             text = cache.read_text(encoding="utf-8")
             print(f"FAILED ({exc}) — using cached ({len(text):,} bytes)")
@@ -201,9 +202,7 @@ def dedup(rules: list[dict]) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# Upstream filter lists occasionally include rules that block an entire site
-# root rather than a specific ad/tracker endpoint. We maintain an exact-match
-# set of the known-bad url-filter values and drop them at build time.
+# Blanket domain-block filter protection
 # ---------------------------------------------------------------------------
 _BLANKET_DOMAIN_BLOCK_FILTERS: frozenset[str] = frozenset({
     r"^[a-z]+://([a-z0-9.-]+\.)?reddit\.com",
@@ -231,6 +230,86 @@ def drop_main_domain_blocks(rules: list[dict]) -> list[dict]:
     return result
 
 
+# ---------------------------------------------------------------------------
+# Safe-site exception rules (v3.1)
+# ---------------------------------------------------------------------------
+
+def safe_site_exceptions() -> list[dict]:
+    """
+    Generate ignore-previous-rules exceptions for sites whose own first-party
+    APIs overlap with tracker patterns in upstream lists.
+    """
+    rules = []
+
+    # Google Workspace: needs googletagmanager, google-analytics, etc.
+    google_ws_domains = [
+        "*docs.google.com", "*sheets.google.com", "*slides.google.com",
+        "*forms.google.com", "*drive.google.com", "*mail.google.com",
+        "*calendar.google.com", "*meet.google.com",
+    ]
+    google_service_patterns = [
+        r".*googletagmanager\.com",
+        r".*google-analytics\.com",
+        r".*analytics\.google\.com",
+        r".*googleadservices\.com",
+    ]
+    for pattern in google_service_patterns:
+        rules.append({
+            "trigger": {
+                "url-filter": pattern,
+                "if-domain": google_ws_domains,
+            },
+            "action": {"type": "ignore-previous-rules"},
+        })
+
+    # DownDetector: status-monitoring API calls match tracker patterns.
+    downdetector_domains = ["*downdetector.com"]
+    downdetector_patterns = [
+        r".*downdetector\.com",
+        r".*google-analytics\.com",
+        r".*googletagmanager\.com",
+    ]
+    for pattern in downdetector_patterns:
+        rules.append({
+            "trigger": {
+                "url-filter": pattern,
+                "if-domain": downdetector_domains,
+            },
+            "action": {"type": "ignore-previous-rules"},
+        })
+
+    # YouTube: ad blocking is handled by ytadblock.js, but broad upstream
+    # rules (EasyPrivacy, etc.) can block YouTube's own infrastructure
+    # (googlevideo.com, ytimg.com, googletagmanager) without mentioning
+    # "youtube" in the url-filter, so strip_yt_rules misses them.
+    # These exceptions prevent the main site from being blocked.
+    yt_domains = [
+        "*youtube.com", "*youtu.be", "*youtube-nocookie.com",
+        "*youtubekids.com", "*music.youtube.com",
+    ]
+    yt_infra_patterns = [
+        r".*googlevideo\.com",
+        r".*ytimg\.com",
+        r".*ggpht\.com",
+        r".*googletagmanager\.com",
+        r".*google-analytics\.com",
+        r".*youtube\.com",
+        r".*youtu\.be",
+        r".*gstatic\.com",
+        r".*googleapis\.com",
+    ]
+    for pattern in yt_infra_patterns:
+        rules.append({
+            "trigger": {
+                "url-filter": pattern,
+                "if-domain": yt_domains,
+            },
+            "action": {"type": "ignore-previous-rules"},
+        })
+
+    return rules
+
+
 _EXCLUSIVE_CONDITIONS = ("if-domain", "unless-domain", "if-top-url", "unless-top-url")
 
 
@@ -238,7 +317,6 @@ def sanitize_rules(rules: list[dict]) -> list[dict]:
     """
     Enforce WebKit's constraint: a trigger may have at most one of
     if-domain, unless-domain, if-top-url, unless-top-url.
-    When a rule has multiple, keep if-domain (most specific) and drop the rest.
     """
     result: list[dict] = []
     n_fixed = 0
@@ -248,13 +326,11 @@ def sanitize_rules(rules: list[dict]) -> list[dict]:
         if len(present) <= 1:
             result.append(rule)
             continue
-        # More than one condition — fix by keeping if-domain preferentially
         fixed_trigger = dict(t)
         if "if-domain" in fixed_trigger or "if-top-url" in fixed_trigger:
             fixed_trigger.pop("unless-domain", None)
             fixed_trigger.pop("unless-top-url", None)
         else:
-            # Only unless-* present (shouldn't happen, but just drop all but first)
             for k in present[1:]:
                 fixed_trigger.pop(k, None)
         result.append({"trigger": fixed_trigger, "action": rule["action"]})
@@ -274,7 +350,6 @@ def fix_original_rules(rules: list[dict]) -> list[dict]:
     n_cdn = n_non_ad = n_dup = n_wk = 0
     for rule in rules:
         uf = rule.get("trigger", {}).get("url-filter", "")
-        # Apply WebKit fixes to hand-curated rules
         uf = expand_shorthand_character_classes(uf)
         rule["trigger"]["url-filter"] = uf
         if is_cdn_rule(uf):
@@ -297,12 +372,10 @@ def fix_original_rules(rules: list[dict]) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# WebKit regex compatibility — adopted from Bieletees' tested fixes.
-# WebKit's content-blocking engine uses a restricted subset of ICU regex.
+# WebKit regex compatibility
 # ---------------------------------------------------------------------------
 
 def expand_shorthand_character_classes(regex: str) -> str:
-    """Expand \\w, \\d, \\s into their literal character class equivalents."""
     regex = re.sub(r"(?<!\\)\\w", "[a-zA-Z0-9_]", regex)
     regex = re.sub(r"(?<!\\)\\d", "[0-9]", regex)
     regex = re.sub(r"(?<!\\)\\s", "[ \\t\\r\\n\\v\\f]", regex)
@@ -310,52 +383,30 @@ def expand_shorthand_character_classes(regex: str) -> str:
 
 
 def is_webkit_compatible(regex: str) -> bool:
-    """
-    Check if a regex string is compatible with WebKit's content-blocking engine.
-    WebKit uses ICU regexes but disables many features.
-    """
-    # 1. Basic Python compile check.
     try:
         re.compile(regex, re.IGNORECASE)
     except re.error:
         return False
-
-    # 2. Unsupported features (non-capturing groups, lookarounds, etc.)
     if "(?" in regex:
         return False
-
-    # 3. $ in middle of regex (only valid as end-anchor)
     if "$" in regex:
         for m in re.finditer(r"\$", regex):
             if m.end() < len(regex):
                 next_char = regex[m.end()]
                 if next_char not in ("|", ")"):
                     return False
-
-    # 4. Shorthand character classes that weren't expanded
     if re.search(r"\\[wdsWDS]", regex):
         return False
-
-    # 5. Bounded repetitions {n,m} — WebKit only supports *, +, ?
     if "{" in regex:
         return False
-
-    # 6. Disjunctions/alternation (a|b) — not supported by WebKit's engine
     if "|" in regex:
         return False
-
-    # 7. Backreferences (\\1, \\2, ...)
     if re.search(r"\\\d", regex):
         return False
-
-    # 8. Excessive length
     if len(regex) > 512:
         return False
-
-    # 9. Nested character classes
     if "[[" in regex or "]]" in regex:
         return False
-
     return True
 
 
@@ -364,24 +415,19 @@ def is_webkit_compatible(regex: str) -> bool:
 # ---------------------------------------------------------------------------
 
 def _escape_for_icu(text: str) -> str:
-    """Escape a literal string for use in an ICU regex url-filter."""
     return re.sub(r"([.+?{}()\[\]\\^$|])", r"\\\1", text)
 
 
 def _pattern_to_url_filter(pattern: str) -> str | None:
-    """Convert ABP pattern to WK ICU regex url-filter. Returns None if invalid."""
     if pattern.startswith("||"):
-        # Domain anchor: ||domain.com^ → match domain in any protocol
         rest = pattern[2:].rstrip("^").rstrip("/").rstrip("*")
         if not rest:
             return None
         parts = re.split(r"\*", rest)
         escaped_parts = [_escape_for_icu(p) for p in parts]
         inner = ".*".join(escaped_parts)
-        # Use simple, ICU-safe character classes (no backslash escapes inside [])
         url_filter = f"^[a-z]+://([a-z0-9.-]+\\.)?{inner}"
     elif pattern.startswith("|") and not pattern.startswith("||"):
-        # URL-start anchor: |https://...
         rest = pattern[1:].rstrip("^")
         if not rest:
             return None
@@ -389,10 +435,8 @@ def _pattern_to_url_filter(pattern: str) -> str | None:
         escaped = escaped.replace("\\*", ".*").replace("\\^", "[/?&]?")
         url_filter = escaped
     elif pattern.startswith("/") and pattern.endswith("/") and len(pattern) > 2:
-        # Regex literal: /pattern/
         url_filter = pattern[1:-1]
     else:
-        # Plain pattern with possible wildcards
         p = pattern.rstrip("^")
         if not p or p == "*":
             return None
@@ -402,19 +446,13 @@ def _pattern_to_url_filter(pattern: str) -> str | None:
             return None
         url_filter = f".*{escaped}"
 
-    # Expand shorthand classes and validate against WebKit constraints
     url_filter = expand_shorthand_character_classes(url_filter)
     if not is_webkit_compatible(url_filter):
         return None
-
     return url_filter
 
 
 def abp_to_wk(line: str, is_exception: bool = False) -> dict | None:
-    """
-    Convert one ABP/uBlock filter line to a WKContentRuleList rule dict.
-    If is_exception=True, the action is ignore-previous-rules instead of block.
-    """
     line = line.strip()
     if not line:
         return None
@@ -427,16 +465,12 @@ def abp_to_wk(line: str, is_exception: bool = False) -> dict | None:
     if line.startswith("+js(") or line.startswith("js("):
         return None
 
-    # Handle exception rules
     if line.startswith("@@"):
         return abp_to_wk(line[2:], is_exception=True)
 
-    # Skip exceptions in non-exception parsing mode (they're handled separately)
     if not is_exception and line.startswith("@"):
         return None
 
-    # Split options — use Bieletees' smarter detection to avoid false splits
-    # on patterns where $ is part of the literal match, not an option separator
     options_str = ""
     pattern = line
     if "$" in line:
@@ -455,7 +489,6 @@ def abp_to_wk(line: str, is_exception: bool = False) -> dict | None:
                 pattern = line[:idx]
                 options_str = line[idx + 1:]
 
-    # Parse options
     resource_types: list[str] = []
     load_types: list[str] = []
     if_domains: list[str] = []
@@ -471,14 +504,11 @@ def abp_to_wk(line: str, is_exception: bool = False) -> dict | None:
             if key_lower.startswith("denyallow="):
                 return None
 
-            # $redirect and $removeparam: still generate the block rule for
-            # network blocking; the sidecar extractors handle the rest separately.
             if key_lower.startswith("redirect=") or key_lower.startswith("redirect-rule="):
-                continue  # skip this option but don't skip the whole rule
+                continue
             if key_lower.startswith("removeparam=") or key_lower == "removeparam":
                 continue
 
-            # NEW: domain= support → if-domain / unless-domain
             if key_lower.startswith("domain="):
                 domain_value = opt.split("=", 1)[1]
                 for d in domain_value.split("|"):
@@ -503,31 +533,22 @@ def abp_to_wk(line: str, is_exception: bool = False) -> dict | None:
                     if wk_type not in resource_types:
                         resource_types.append(wk_type)
 
-    # Convert pattern to url-filter
     url_filter = _pattern_to_url_filter(pattern)
     if url_filter is None:
         return None
 
-    # Guard against overly broad rules
     if url_filter in (".*", ".*.*", ".*.*.*", ".*[a-z0-9+\\\\-.]*://"):
         return None
 
-    # CDN / non-ad-network safety (skip for exception rules — they're allowlists)
     if not is_exception:
         if is_cdn_rule(url_filter) or is_non_ad_network(url_filter):
             return None
-
-    # url_filter was already validated by _pattern_to_url_filter → _is_icu_safe
 
     trigger: dict[str, Any] = {"url-filter": url_filter}
     if resource_types:
         trigger["resource-type"] = resource_types
     if load_types:
         trigger["load-type"] = load_types
-    # WebKit: a trigger cannot have more than one of if-domain, unless-domain,
-    # if-top-url, unless-top-url. When domain= mixes positive and negated entries
-    # we'd get both if-domain + unless-domain, which causes a compile error.
-    # Prefer if-domain (more specific scope) and discard unless-domain.
     if if_domains and unless_domains:
         unless_domains = []
 
@@ -541,11 +562,10 @@ def abp_to_wk(line: str, is_exception: bool = False) -> dict | None:
 
 
 # ---------------------------------------------------------------------------
-# Parse upstream lists (block rules + exception rules separately)
+# Parse upstream lists
 # ---------------------------------------------------------------------------
 
 def parse_upstream(name: str, text: str) -> tuple[list[dict], list[dict]]:
-    """Returns (block_rules, exception_rules)."""
     if not text:
         print(f"    {name}: (empty — skipped)")
         return [], []
@@ -583,10 +603,8 @@ def parse_upstream(name: str, text: str) -> tuple[list[dict], list[dict]]:
 # ---------------------------------------------------------------------------
 
 def extract_cosmetic_selectors(texts: dict[str, str]) -> list[str]:
-    """Generic CSS selectors from EasyList + uBlock cosmetic filters."""
     selectors: list[str] = []
     seen: set[str] = set()
-
     for text in texts.values():
         for line in text.splitlines():
             line = line.strip()
@@ -597,34 +615,32 @@ def extract_cosmetic_selectors(texts: dict[str, str]) -> list[str]:
             domain_part, _, selector = line.partition("##")
             selector = selector.strip()
             if (not domain_part or domain_part == "*") and selector and selector not in seen:
-                # Allow native :has() (WebKit supports it), skip other extended syntax
                 if ":-abp-" in selector or ":xpath(" in selector:
                     continue
                 if ":has-text(" in selector or ":matches-css(" in selector:
-                    continue  # handled separately as procedural filters
+                    continue
                 seen.add(selector)
                 selectors.append(selector)
-
-    return selectors[:3_000]  # keep high-signal selectors, lighter output
+    return selectors[:3_000]
 
 
 def cosmetic_to_native_rules(selectors: list[str]) -> list[dict]:
-    """
-    Convert generic CSS selectors to native WKContentRuleList css-display-none
-    rules. These are applied before paint — zero flicker, zero JS overhead.
-    """
     COSMETIC_EXCLUDE_DOMAINS = [
-        # GitHub — complex layout; EasyList selectors can accidentally hide
-        # Primer CSS components and break page width/structure.
+        # GitHub — complex layout
         "*github.com", "*githubusercontent.com",
-        # Spotify — streaming player; cosmetic hiding is not needed and
-        # can interfere with player initialisation.
+        # Spotify — streaming player
         "*spotify.com", "*scdn.co",
+        # Google Workspace — complex apps; cosmetic hiding + googletag
+        # stubs break Docs, Sheets, Slides, Forms, Drive.
+        "*docs.google.com", "*sheets.google.com", "*slides.google.com",
+        "*forms.google.com", "*drive.google.com", "*mail.google.com",
+        "*calendar.google.com", "*meet.google.com",
+        # DownDetector — status monitoring; ad selectors hide functional UI.
+        "*downdetector.com",
     ]
 
     rules: list[dict] = []
     for sel in selectors:
-        # WKContentRuleList css-display-none only supports simple selectors
         if "," in sel or "::" in sel or "iframe[src" in sel:
             continue
         rules.append({
@@ -675,13 +691,8 @@ def strip_yt_rules(rules: list[dict]) -> list[dict]:
 
 
 def extract_domain_cosmetic_selectors(texts: dict[str, str]) -> dict[str, list[str]]:
-    """
-    Extract domain-specific cosmetic selectors → {domain: [selector, ...]}.
-    The browser injects only matching selectors per domain via WKUserScript.
-    """
     domain_selectors: dict[str, list[str]] = defaultdict(list)
     seen: dict[str, set[str]] = defaultdict(set)
-
     for text in texts.values():
         for line in text.splitlines():
             line = line.strip()
@@ -693,14 +704,12 @@ def extract_domain_cosmetic_selectors(texts: dict[str, str]) -> dict[str, list[s
             selector = selector.strip()
             if not selector:
                 continue
-            # Skip generic (handled by native rules) and extended syntax
             if not domain_part or domain_part == "*":
                 continue
             if ":-abp-" in selector or ":xpath(" in selector:
                 continue
             if ":has-text(" in selector or ":matches-css(" in selector:
                 continue
-            # Handle comma-separated domains
             for domain in domain_part.split(","):
                 domain = domain.strip().lstrip("~")
                 if not domain or domain.startswith("~"):
@@ -710,16 +719,12 @@ def extract_domain_cosmetic_selectors(texts: dict[str, str]) -> dict[str, list[s
                 if selector not in seen[domain]:
                     seen[domain].add(selector)
                     domain_selectors[domain].append(selector)
-
-    # Cap per-domain to avoid huge entries
     return {d: sels[:200] for d, sels in domain_selectors.items()}
 
 
 def extract_has_text_filters(texts: dict[str, str]) -> list[dict]:
-    """Extract :has-text() procedural cosmetic filters for JS-based hiding."""
     filters: list[dict] = []
     seen: set[str] = set()
-
     for text in texts.values():
         for line in text.splitlines():
             line = line.strip()
@@ -729,8 +734,7 @@ def extract_has_text_filters(texts: dict[str, str]) -> list[dict]:
                 continue
             domain_part, _, selector = line.partition("##")
             if domain_part and domain_part != "*":
-                continue  # skip domain-specific for now
-            # Parse :has-text(pattern)
+                continue
             match = re.match(r"(.+?):has-text\((.+?)\)$", selector)
             if not match:
                 continue
@@ -741,7 +745,6 @@ def extract_has_text_filters(texts: dict[str, str]) -> list[dict]:
                 continue
             seen.add(key)
             filters.append({"selector": css_sel, "text": text_pattern})
-
     return filters[:500]
 
 
@@ -750,32 +753,25 @@ def extract_has_text_filters(texts: dict[str, str]) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 SUPPORTED_SCRIPTLETS = {
-    # Original 12
     "set-constant", "trusted-set-constant",
     "abort-on-property-read", "aopr",
     "abort-on-property-write", "aopw",
     "no-fetch-if", "no-xhr-if",
     "prevent-setTimeout", "prevent-setInterval",
     "remove-attr", "remove-class",
-    # NEW: 15 more scriptlets
     "prevent-addEventListener", "addEventListener-defuser",
     "prevent-window-open",
     "noeval", "noeval-if",
-    "set-attr",
-    "set-cookie",
-    "remove-node-text",
-    "json-prune",
+    "set-attr", "set-cookie", "remove-node-text", "json-prune",
     "no-setInterval-if", "no-setTimeout-if",
     "adjust-setInterval", "adjust-setTimeout",
-    "disable-newtab-links",
-    "window-close-if",
+    "disable-newtab-links", "window-close-if",
     "prevent-refresh",
     "abort-current-inline-script", "acis",
 }
 
 
 def extract_scriptlet_configs(texts: dict[str, str]) -> list[tuple[str, list[str]]]:
-    """Generic (wildcard-domain) +js() scriptlet configs."""
     counter: Counter = Counter()
     for text in texts.values():
         for line in text.splitlines():
@@ -799,7 +795,6 @@ def extract_scriptlet_configs(texts: dict[str, str]) -> list[tuple[str, list[str
 
 
 def extract_site_scriptlet_configs(texts: dict[str, str]) -> dict[str, list[list[str]]]:
-    """Domain-specific +js() scriptlet configs → {hostname: [[name, arg, ...], ...]}."""
     rules: dict[str, list[list[str]]] = defaultdict(list)
     for text in texts.values():
         for line in text.splitlines():
@@ -826,47 +821,31 @@ def extract_site_scriptlet_configs(texts: dict[str, str]) -> dict[str, list[list
 
 
 # ---------------------------------------------------------------------------
-# $redirect extraction → redirect_rules.json
-# Maps url patterns to redirect resource names for browser-side
-# WKURLSchemeHandler implementation.
+# $redirect extraction
 # ---------------------------------------------------------------------------
 
-# uBO redirect resource names we can stub
 KNOWN_REDIRECT_RESOURCES = {
-    # Script stubs
     "noopjs", "noop.js",
     "google-analytics_analytics.js", "google-analytics.com/analytics.js",
     "googletagmanager_gtm.js", "googletagmanager.com/gtm.js",
     "googlesyndication_adsbygoogle.js", "googlesyndication.com/adsbygoogle.js",
     "googletagservices_gpt.js", "googletagservices.com/gpt.js",
     "google-analytics_ga.js", "google-analytics.com/ga.js",
-    "google-analytics_cx_api.js",
-    "scorecardresearch_beacon.js",
+    "google-analytics_cx_api.js", "scorecardresearch_beacon.js",
     "outbrain-widget.js",
     "amazon_ads.js", "amazon-adsystem.com/aax2/apstag.js",
     "doubleclick_instream_ad_status.js",
-    "fingerprint2.js", "fingerprint3.js",
-    "prebid-ads.js",
-    # Image/pixel stubs
+    "fingerprint2.js", "fingerprint3.js", "prebid-ads.js",
     "1x1.gif", "2x2.png", "3x2.png", "32x32.png",
     "noopimage", "noop-1s.mp4", "noopvast-2.0", "noopvast-3.0", "noopvast-4.0",
     "noopmp3-0.1s", "noopmp4-1s",
-    # Frame stubs
-    "noopframe", "noop.html",
-    # Text stubs
-    "nooptext", "noop.txt",
-    "empty",
+    "noopframe", "noop.html", "nooptext", "noop.txt", "empty",
 }
 
 
 def extract_redirect_rules(texts: dict[str, str]) -> list[dict]:
-    """
-    Extract $redirect and $redirect-rule filters.
-    Returns list of {pattern, resource, domains?} for browser-side handling.
-    """
     rules: list[dict] = []
     seen: set[str] = set()
-
     for text in texts.values():
         for line in text.splitlines():
             line = line.strip()
@@ -876,95 +855,70 @@ def extract_redirect_rules(texts: dict[str, str]) -> list[dict]:
                 continue
             if "$" not in line:
                 continue
-
             idx = line.rfind("$")
             pattern = line[:idx]
             options_str = line[idx + 1:]
-
             redirect_resource = None
             domains: list[str] = []
-
             for opt in options_str.split(","):
                 opt = opt.strip()
                 if opt.startswith("redirect=") or opt.startswith("redirect-rule="):
                     redirect_resource = opt.split("=", 1)[1].strip()
                 elif opt.startswith("domain="):
                     domains = [d.strip() for d in opt.split("=", 1)[1].split("|") if d.strip()]
-
             if not redirect_resource:
                 continue
             if redirect_resource not in KNOWN_REDIRECT_RESOURCES:
                 continue
-
             key = f"{pattern}|{redirect_resource}"
             if key in seen:
                 continue
             seen.add(key)
-
-            entry: dict[str, Any] = {
-                "pattern": pattern,
-                "resource": redirect_resource,
-            }
+            entry: dict[str, Any] = {"pattern": pattern, "resource": redirect_resource}
             if domains:
                 entry["domains"] = domains
             rules.append(entry)
-
     return rules[:2000]
 
 
 # ---------------------------------------------------------------------------
-# $removeparam extraction → removeparam_rules.json
+# $removeparam extraction
 # ---------------------------------------------------------------------------
 
 def extract_removeparam_rules(texts: dict[str, str]) -> list[dict]:
-    """
-    Extract $removeparam filters.
-    Returns list of {param, pattern?, domains?} for browser-side URL stripping.
-    """
     rules: list[dict] = []
     seen: set[str] = set()
-
     for text in texts.values():
         for line in text.splitlines():
             line = line.strip()
             if not line or line.startswith("!") or line.startswith("["):
                 continue
-
             is_exception = line.startswith("@@")
             if is_exception:
                 line = line[2:]
-
             if "$" not in line or "removeparam" not in line:
                 continue
-
             idx = line.rfind("$")
             pattern = line[:idx] if idx > 0 else ""
             options_str = line[idx + 1:]
-
             param_name = None
             domains: list[str] = []
-
             for opt in options_str.split(","):
                 opt = opt.strip()
                 if opt.startswith("removeparam="):
                     param_name = opt.split("=", 1)[1].strip()
                 elif opt == "removeparam":
-                    continue  # bare removeparam without value — skip
+                    continue
                 elif opt.startswith("domain="):
                     domains = [d.strip() for d in opt.split("=", 1)[1].split("|") if d.strip()]
-
             if not param_name:
                 continue
-
-            # Skip regex params (start with /) — too complex for simple stripping
             if param_name.startswith("/"):
                 continue
-
             key = f"{param_name}|{pattern}"
             if key in seen:
                 continue
             seen.add(key)
-
             entry: dict[str, Any] = {"param": param_name}
             if pattern:
                 entry["pattern"] = pattern
@@ -973,7 +927,6 @@ def extract_removeparam_rules(texts: dict[str, str]) -> list[dict]:
             if is_exception:
                 entry["exception"] = True
             rules.append(entry)
-
     return rules
 
 
@@ -982,26 +935,17 @@ def extract_removeparam_rules(texts: dict[str, str]) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 def apply_badfilters(texts: dict[str, str]) -> dict[str, str]:
-    """
-    Process $badfilter directives: collect all lines ending with $badfilter,
-    then remove the corresponding filter (without $badfilter) from all lists.
-    Returns modified texts dict.
-    """
     bad_lines: set[str] = set()
     for text in texts.values():
         for line in text.splitlines():
             line = line.strip()
             if line.endswith("$badfilter"):
-                # The original filter is the same line without $badfilter
                 original = line.rsplit("$badfilter", 1)[0]
-                # Remove trailing comma if present
                 original = original.rstrip(",").rstrip("$").rstrip(",")
                 if original:
                     bad_lines.add(original)
-
     if not bad_lines:
         return texts
-
     result: dict[str, str] = {}
     removed = 0
     for name, text in texts.items():
@@ -1013,16 +957,15 @@ def apply_badfilters(texts: dict[str, str]) -> dict[str, str]:
                 continue
             filtered_lines.append(line)
         result[name] = "\n".join(filtered_lines)
-
     print(f"    $badfilter: removed {removed} invalidated filters")
     return result
 
 
 # ---------------------------------------------------------------------------
-# scriptlets.js template — expanded to 25+ scriptlets
+# scriptlets.js template — v3.1 with nativize + Google Workspace guard
 # ---------------------------------------------------------------------------
 
-SCRIPTLETS_JS_TEMPLATE = r"""// Emerald Ad Blocker — scriptlets.js (v3)
+SCRIPTLETS_JS_TEMPLATE = r"""// Emerald Ad Blocker — scriptlets.js (v3.1)
 // Injected by WKUserScript at document_start.
 // Generated by src/build.py — do not edit by hand.
 // Implements uBlock Origin's scriptlet API (25+ scriptlets).
@@ -1030,16 +973,31 @@ SCRIPTLETS_JS_TEMPLATE = r"""// Emerald Ad Blocker — scriptlets.js (v3)
   'use strict';
 
   // ── Subframe guard ────────────────────────────────────────────────────────
-  // Exit immediately in cross-origin iframes. Injecting scriptlets there
-  // wraps fetch/XHR/timers inside media-player frames and breaks playback.
-  // Fully sandboxed frames (no allow-scripts) are blocked at the WebKit level
-  // before this runs — this guard catches the cross-origin frames that do
-  // execute scripts but must not have their APIs modified.
   if (window.self !== window.top) {
     try { window.top.location.href; } catch (e) { return; }
   }
 
+  // ── Safe-site guard ────────────────────────────────────────────────────
+  // Don't run scriptlets on Google Workspace or DownDetector — they depend
+  // on Google's own ad/analytics infrastructure for functional features,
+  // and DownDetector's API paths match tracker patterns.
+  var _scriptletHost = window.location.hostname;
+  if (/^(docs|sheets|slides|forms|drive|mail|calendar|meet)\.google\.com$/.test(_scriptletHost) ||
+      /downdetector\.com$/.test(_scriptletHost)) {
+    return;
+  }
+
   var _noop = function () {};
+
+  // ── Nativize helper ───────────────────────────────────────────────────────
+  // Restore .toString() on wrapped functions so fingerprint scripts see
+  // "[native code]" and don't fall back to a wrong-OS default path.
+  function nativize(wrapper, original) {
+    var nativeStr = 'function ' + (original.name || '') + '() { [native code] }';
+    wrapper.toString = function () { return nativeStr; };
+    if (original.prototype) wrapper.prototype = original.prototype;
+    return wrapper;
+  }
 
   // ── Utilities ─────────────────────────────────────────────────────────────
 
@@ -1153,29 +1111,27 @@ SCRIPTLETS_JS_TEMPLATE = r"""// Emerald Ad Blocker — scriptlets.js (v3)
     var re = pattern ? new RegExp(pattern) : null;
     var _fetch = window.fetch;
     if (typeof _fetch !== 'function') return;
-    window.fetch = function (input) {
+    window.fetch = nativize(function (input) {
       var url = typeof input === 'string' ? input : (input && input.url) || '';
       if (!re || re.test(url)) {
         return Promise.reject(new TypeError('Failed to fetch'));
       }
       return _fetch.apply(this, arguments);
-    };
+    }, _fetch);
   }
 
   function noXhrIf(pattern) {
     var re = pattern ? new RegExp(pattern) : null;
     var _open = XMLHttpRequest.prototype.open;
-    XMLHttpRequest.prototype.open = function (method, url) {
+    XMLHttpRequest.prototype.open = nativize(function (method, url) {
       if (!re || re.test(url)) {
         Object.defineProperty(this, '_blocked', { value: true, configurable: true });
       }
       return _open.apply(this, arguments);
-    };
+    }, _open);
     var _send = XMLHttpRequest.prototype.send;
-    XMLHttpRequest.prototype.send = function () {
+    XMLHttpRequest.prototype.send = nativize(function () {
       if (this._blocked) {
-        // Fire a network-error event so callers get proper rejection handling
-        // rather than an XHR that hangs forever.
         var self = this;
         setTimeout(function () {
           try {
@@ -1187,61 +1143,60 @@ SCRIPTLETS_JS_TEMPLATE = r"""// Emerald Ad Blocker — scriptlets.js (v3)
         return;
       }
       return _send.apply(this, arguments);
-    };
+    }, _send);
   }
 
   function preventSetTimeout(pattern, delay) {
     var re = pattern ? new RegExp(pattern) : null;
     var _st = window.setTimeout;
-    window.setTimeout = function (fn, d) {
+    window.setTimeout = nativize(function (fn, d) {
       var src = typeof fn === 'function' ? fn.toString() : String(fn);
       var delayMatch = delay === undefined || delay === '' || String(d) === String(delay);
       if (delayMatch && (!re || re.test(src))) return 0;
       return _st.apply(this, arguments);
-    };
+    }, _st);
   }
 
   function preventSetInterval(pattern, delay) {
     var re = pattern ? new RegExp(pattern) : null;
     var _si = window.setInterval;
-    window.setInterval = function (fn, d) {
+    window.setInterval = nativize(function (fn, d) {
       var src = typeof fn === 'function' ? fn.toString() : String(fn);
       var delayMatch = delay === undefined || delay === '' || String(d) === String(delay);
       if (delayMatch && (!re || re.test(src))) return 0;
       return _si.apply(this, arguments);
-    };
+    }, _si);
   }
 
   function preventAddEventListener(type, pattern) {
     var reType = type ? new RegExp(type) : null;
     var reFn = pattern ? new RegExp(pattern) : null;
     var _ael = EventTarget.prototype.addEventListener;
-    EventTarget.prototype.addEventListener = function (t, fn, opts) {
+    EventTarget.prototype.addEventListener = nativize(function (t, fn, opts) {
       if (reType && !reType.test(t)) return _ael.apply(this, arguments);
       if (reFn) {
         var src = typeof fn === 'function' ? fn.toString() : String(fn);
         if (!reFn.test(src)) return _ael.apply(this, arguments);
       }
-      // Silently swallow the listener
-    };
+    }, _ael);
   }
 
   function preventWindowOpen(pattern) {
     var re = pattern ? new RegExp(pattern) : null;
     var _open = window.open;
-    window.open = function (url) {
+    window.open = nativize(function (url) {
       if (!re || re.test(url || '')) return null;
       return _open.apply(this, arguments);
-    };
+    }, _open);
   }
 
   function noeval(pattern) {
     var re = pattern ? new RegExp(pattern) : null;
     var _eval = window.eval;
-    window.eval = function (code) {
+    window.eval = nativize(function (code) {
       if (!re || re.test(code)) return undefined;
       return _eval.call(this, code);
-    };
+    }, _eval);
   }
 
   function removeAttr(attr, selector) {
@@ -1298,7 +1253,7 @@ SCRIPTLETS_JS_TEMPLATE = r"""// Emerald Ad Blocker — scriptlets.js (v3)
     var paths = rawPaths ? rawPaths.split(' ') : [];
     if (!paths.length) return;
     var _parse = JSON.parse;
-    JSON.parse = function () {
+    JSON.parse = nativize(function () {
       var r = _parse.apply(this, arguments);
       if (r && typeof r === 'object') {
         paths.forEach(function (p) {
@@ -1314,9 +1269,9 @@ SCRIPTLETS_JS_TEMPLATE = r"""// Emerald Ad Blocker — scriptlets.js (v3)
         });
       }
       return r;
-    };
+    }, _parse);
     var _rj = Response.prototype.json;
-    Response.prototype.json = function () {
+    Response.prototype.json = nativize(function () {
       return _rj.apply(this, arguments).then(function (data) {
         if (data && typeof data === 'object') {
           paths.forEach(function (p) {
@@ -1333,33 +1288,33 @@ SCRIPTLETS_JS_TEMPLATE = r"""// Emerald Ad Blocker — scriptlets.js (v3)
         }
         return data;
       });
-    };
+    }, _rj);
   }
 
   function adjustSetInterval(pattern, multiplier) {
     var re = pattern ? new RegExp(pattern) : null;
     var mult = parseFloat(multiplier) || 0.001;
     var _si = window.setInterval;
-    window.setInterval = function (fn, d) {
+    window.setInterval = nativize(function (fn, d) {
       var src = typeof fn === 'function' ? fn.toString() : String(fn);
       if (!re || re.test(src)) {
         arguments[1] = Math.round((d || 0) * mult);
       }
       return _si.apply(this, arguments);
-    };
+    }, _si);
   }
 
   function adjustSetTimeout(pattern, multiplier) {
     var re = pattern ? new RegExp(pattern) : null;
     var mult = parseFloat(multiplier) || 0.001;
     var _st = window.setTimeout;
-    window.setTimeout = function (fn, d) {
+    window.setTimeout = nativize(function (fn, d) {
       var src = typeof fn === 'function' ? fn.toString() : String(fn);
       if (!re || re.test(src)) {
         arguments[1] = Math.round((d || 0) * mult);
       }
       return _st.apply(this, arguments);
-    };
+    }, _st);
   }
 
   function disableNewtabLinks() {
@@ -1462,20 +1417,18 @@ SCRIPTLETS_JS_TEMPLATE = r"""// Emerald Ad Blocker — scriptlets.js (v3)
 
   noFetchIf('googlesyndication\\.com');
   noFetchIf('doubleclick\\.net');
-  noFetchIf('google-analytics\\.com/collect');
-  noFetchIf('google-analytics\\.com/g/collect');
-  noFetchIf('facebook\\.net/en_US/fbevents');
+  noFetchIf('google-analytics\\.com\/collect');
+  noFetchIf('google-analytics\\.com\/g\/collect');
+  noFetchIf('facebook\\.net\/en_US\/fbevents');
   noFetchIf('hotjar\\.com');
   noFetchIf('fullstory\\.com');
   noFetchIf('clarity\\.ms');
 
   noXhrIf('googlesyndication\\.com');
   noXhrIf('doubleclick\\.net');
-  noXhrIf('google-analytics\\.com/collect');
-  noXhrIf('facebook\\.net/en_US/fbevents');
+  noXhrIf('google-analytics\\.com\/collect');
+  noXhrIf('facebook\\.net\/en_US\/fbevents');
 
-  // Target known anti-adblocker library names only, not generic "AdBlock" strings
-  // that would also match legitimate ad-block tester detection code.
   preventSetTimeout('blockadblock|BlockAdBlock|fuckAdBlock|FuckAdBlock');
   preventSetInterval('blockadblock|BlockAdBlock|fuckAdBlock|FuckAdBlock');
 
@@ -1497,16 +1450,30 @@ def build_scriptlets_js(configs: list[tuple[str, list[str]]]) -> str:
 
 
 # ---------------------------------------------------------------------------
-# WebSocket / WebRTC blocking script
+# WebSocket / WebRTC blocking script — v3.1 with nativize + narrowed beacons
 # ---------------------------------------------------------------------------
 
-WEBSOCKET_BLOCK_JS = r"""// Emerald Ad Blocker — websocket_block.js
+WEBSOCKET_BLOCK_JS = r"""// Emerald Ad Blocker — websocket_block.js (v3.1)
 // Injected by WKUserScript at document_start.
 // Blocks WebSocket connections to known trackers and prevents WebRTC IP leaks.
 (function () {
   'use strict';
 
-  // ── WebSocket blocking ────────────────────────────────────────────────────
+  // ── Domain guard: skip on safe domains ──────────────────────────────────
+  var _wsHost = window.location.hostname;
+  if (/\.(google|googleapis|gstatic)\.com$/.test(_wsHost) ||
+      /downdetector\.com$/.test(_wsHost)) {
+    return;
+  }
+
+  // ── Nativize helper ───────────────────────────────────────────────────
+  function nativize(wrapper, original) {
+    var nativeStr = 'function ' + (original.name || '') + '() { [native code] }';
+    wrapper.toString = function () { return nativeStr; };
+    return wrapper;
+  }
+
+  // ── WebSocket blocking ────────────────────────────────────────────────
 
   var _WS = window.WebSocket;
   var BLOCKED_WS = [
@@ -1520,7 +1487,7 @@ WEBSOCKET_BLOCK_JS = r"""// Emerald Ad Blocker — websocket_block.js
     /adnxs\.com/i, /rubiconproject\.com/i,
   ];
 
-  window.WebSocket = function (url, protocols) {
+  var _wsWrapper = function (url, protocols) {
     var urlStr = String(url);
     for (var i = 0; i < BLOCKED_WS.length; i++) {
       if (BLOCKED_WS[i].test(urlStr)) {
@@ -1537,44 +1504,54 @@ WEBSOCKET_BLOCK_JS = r"""// Emerald Ad Blocker — websocket_block.js
     if (protocols !== undefined) return new _WS(url, protocols);
     return new _WS(url);
   };
+  window.WebSocket = nativize(_wsWrapper, _WS);
   window.WebSocket.prototype = _WS.prototype;
   window.WebSocket.CONNECTING = 0;
   window.WebSocket.OPEN = 1;
   window.WebSocket.CLOSING = 2;
   window.WebSocket.CLOSED = 3;
 
-  // ── WebRTC IP leak prevention ─────────────────────────────────────────────
+  // ── WebRTC IP leak prevention ─────────────────────────────────────────
 
   var _RTC = window.RTCPeerConnection || window.webkitRTCPeerConnection;
   if (_RTC) {
-    window.RTCPeerConnection = function (config, constraints) {
+    var _rtcWrapper = function (config, constraints) {
       if (config && config.iceServers) {
         config.iceServers = [];
       }
       return new _RTC(config, constraints);
     };
+    window.RTCPeerConnection = nativize(_rtcWrapper, _RTC);
     window.RTCPeerConnection.prototype = _RTC.prototype;
     if (window.webkitRTCPeerConnection) {
       window.webkitRTCPeerConnection = window.RTCPeerConnection;
     }
   }
 
-  // ── navigator.sendBeacon blocking ─────────────────────────────────────────
+  // ── navigator.sendBeacon blocking ─────────────────────────────────────
+  // NARROWED in v3.1: Only block beacons to known third-party tracker
+  // domains. Previous patterns (/analytics/i, /collect/i, /pixel/i,
+  // /beacon/i) were too broad and broke Google Workspace.
 
   var _beacon = navigator.sendBeacon;
   var BLOCKED_BEACON = [
-    /google-analytics/i, /doubleclick/i, /facebook/i,
-    /analytics/i, /collect/i, /pixel/i, /beacon/i,
+    /google-analytics\.com/i, /doubleclick\.net/i,
+    /facebook\.net\/tr/i, /connect\.facebook\.net/i,
+    /hotjar\.com/i, /fullstory\.com/i,
+    /segment\.(com|io)\/v1/i, /mixpanel\.com/i,
+    /amplitude\.com/i, /clarity\.ms/i,
+    /mouseflow\.com/i, /taboola\.com/i,
+    /criteo\.(com|net)/i, /pubmatic\.com/i,
   ];
 
   if (_beacon) {
-    navigator.sendBeacon = function (url) {
+    navigator.sendBeacon = nativize(function (url) {
       var urlStr = String(url);
       for (var i = 0; i < BLOCKED_BEACON.length; i++) {
-        if (BLOCKED_BEACON[i].test(urlStr)) return true; // pretend success
+        if (BLOCKED_BEACON[i].test(urlStr)) return true;
       }
       return _beacon.apply(navigator, arguments);
-    };
+    }, _beacon);
   }
 
 })();
@@ -1582,15 +1559,20 @@ WEBSOCKET_BLOCK_JS = r"""// Emerald Ad Blocker — websocket_block.js
 
 
 # ---------------------------------------------------------------------------
-# cosmetic.js template — improved MutationObserver performance
+# cosmetic.js template
 # ---------------------------------------------------------------------------
 
 COSMETIC_JS_TEMPLATE = """\
-// Emerald Ad Blocker — cosmetic.js (v3)
+// Emerald Ad Blocker — cosmetic.js (v3.1)
 // Injected by WKUserScript at document_start.
 // Generated by src/build.py — do not edit by hand.
 (function () {
   'use strict';
+
+  // ── Domain guard: skip CSS hiding on sites where generic ad selectors ──
+  // match functional UI elements (album art, player controls, etc.)
+  var _cosHost = window.location.hostname;
+  var _skipCSSHiding = /\\.(spotify\\.com|scdn\\.co)$/.test(_cosHost);
 
   // ── 1. Anti-adblock stubs ────────────────────────────────────────────────
 
@@ -1643,47 +1625,75 @@ COSMETIC_JS_TEMPLATE = """\
     destroySlots: function () {}, getVersion: function () { return ''; },
     apiReady: true,
   };
-  try {
-    if (!window.googletag || !window.googletag.pubads) {
-      window.googletag = _googletag;
-    } else {
-      window.googletag.cmd = window.googletag.cmd || _googletag.cmd;
-    }
-  } catch (_) {}
+
+  // Guard: don't stub googletag on Google's own domains
+  var _isGoogleOrigin = /\\.(google|googleapis|gstatic)\\.com$/.test(_cosHost);
+  if (!_isGoogleOrigin) {
+    try {
+      if (!window.googletag || !window.googletag.pubads) {
+        window.googletag = _googletag;
+      } else {
+        window.googletag.cmd = window.googletag.cmd || _googletag.cmd;
+      }
+    } catch (_) {}
+  }
 
   // ── 2. CSS hiding ─────────────────────────────────────────────────────────
+  // Skip on domains where generic selectors break functional UI.
+
+  if (!_skipCSSHiding) {
 
   var SELECTORS = [
+    // Google ad network elements
     '[id^="google_ads_"]','[id^="div-gpt-ad"]','[id^="dfp-ad-"]',
     '.adsbygoogle','ins.adsbygoogle','.gpt-ad','.dfp-ad',
     '[data-ad-unit]','[data-adunit]','[data-google-query-id]',
+    // Native ad networks
     '[id*="taboola"]','[class*="taboola"]',
     '[id*="outbrain"]','[class*="outbrain"]',
     '[id*="revcontent"]','[class*="revcontent"]',
+    // Sponsored / native ad patterns
     '[class*="sponsored-content"]','[class*="sponsored_content"]',
     '[class*="native-ad"]',
     '[data-ad-placeholder]','[data-advertisement]',
+    // Generic ad containers
     '.ad-banner','.ad-container','.ad-wrapper','.ad-slot',
     '.advertisement','.advertising','.advertise',
+    // Vox Media / Concert ads (The Verge, Polygon, SB Nation, etc.)
+    '.duet--ad','[data-concert-ads-name]','.c-leaderboard',
+    '.l-ad','.ad__container','.chorus-ad','.chorus-ad--gallery',
+    // Ad iframes
     'iframe[src*="doubleclick.net"]','iframe[src*="googlesyndication.com"]',
     'iframe[src*="adnxs.com"]','iframe[src*="pubmatic.com"]',
-    // Reddit sponsored posts (new shreddit UI + old Reddit)
+    // Reddit sponsored posts
     'shreddit-ad-post','.promotedlink',
     '[data-testid="post-container"][data-promoted="true"]',
+    // YouTube ad elements (sidebar sponsored, masthead, player ads)
+    'ytd-ad-slot-renderer',
+    'ytd-promoted-sparkles-web-renderer',
+    'ytd-display-ad-renderer',
+    'ytd-promoted-video-renderer',
+    'ytd-compact-promoted-video-renderer',
+    'ytd-player-legacy-desktop-watch-ads-renderer',
+    'ytd-banner-promo-renderer',
+    '#player-ads',
+    '#masthead-ad',
+    '.ytd-promoted-sparkles-web-renderer',
+    '.ytd-display-ad-renderer',
+    '.video-ads.ytp-ad-module',
+    '.ytp-ad-overlay-container',
     EASYLIST_SELECTORS
   ];
 
-  // Build a single joined selector string for querySelectorAll
   var _allSelectors = SELECTORS.join(',');
 
   function injectCSS() {
-    // Split selectors into batches of 500 to avoid style engine perf cliffs
     var batchSize = 500;
     for (var b = 0; b < SELECTORS.length; b += batchSize) {
       var batch = SELECTORS.slice(b, b + batchSize);
       var style = document.createElement('style');
       style.id = '__emerald_cosmetic_' + b + '__';
-      style.textContent = batch.join(',\\n') + ' { display: none !important; }';
+      style.textContent = batch.join(',\\n') + ' { display: none !important; height: 0 !important; overflow: hidden !important; margin: 0 !important; padding: 0 !important; }';
       (document.head || document.documentElement).appendChild(style);
     }
   }
@@ -1696,7 +1706,6 @@ COSMETIC_JS_TEMPLATE = """\
 
   // ── 3. MutationObserver (optimized) ───────────────────────────────────────
 
-  // Use a single querySelectorAll per batch instead of per-element matching
   var _hidden = new WeakSet();
   var _pending = false;
 
@@ -1707,6 +1716,8 @@ COSMETIC_JS_TEMPLATE = """\
       for (var i = 0; i < matches.length; i++) {
         if (!_hidden.has(matches[i])) {
           matches[i].style.setProperty('display', 'none', 'important');
+          matches[i].style.setProperty('height', '0', 'important');
+          matches[i].style.setProperty('overflow', 'hidden', 'important');
           _hidden.add(matches[i]);
         }
       }
@@ -1721,6 +1732,8 @@ COSMETIC_JS_TEMPLATE = """\
   });
 
   observer.observe(document.documentElement, { childList: true, subtree: true });
+
+  } // end _skipCSSHiding guard
 
   // ── 4. :has-text() procedural cosmetic filters ────────────────────────────
 
@@ -1744,7 +1757,6 @@ COSMETIC_JS_TEMPLATE = """\
     } else {
       applyHasText();
     }
-    // Re-run on DOM changes (throttled)
     var _htPending = false;
     new MutationObserver(function () {
       if (!_htPending) {
@@ -1767,17 +1779,12 @@ def build_cosmetic_js(selectors: list[str], has_text_filters: list[dict]) -> str
 
 
 # ---------------------------------------------------------------------------
-# Auto-split helper — splits a rule list into 149K chunks
+# Auto-split helper
 # ---------------------------------------------------------------------------
 
 def write_rules_auto_split(
     rules: list[dict], base_name: str, output_dir: Path, root: Path
 ) -> list[str]:
-    """
-    Write rules to one or more JSON files. If len(rules) <= MAX_RULES,
-    writes a single file. Otherwise splits into base_name-1.json, -2.json, etc.
-    Returns list of filenames written.
-    """
     files_written: list[str] = []
     if len(rules) <= MAX_RULES:
         out = output_dir / f"{base_name}.json"
@@ -1851,57 +1858,64 @@ def main() -> None:
             adblock_blocks.extend(blocks)
         all_exceptions.extend(exceptions)
 
-    # ── Build native cosmetic rules (css-display-none) ────────────────────────
+    # ── Build native cosmetic rules ───────────────────────────────────────────
     print("\n=== Building native cosmetic rules ===")
     cosmetic_selectors = extract_cosmetic_selectors(raw)
     native_cosmetic = cosmetic_to_native_rules(cosmetic_selectors)
-    print(f"  {len(native_cosmetic):,} selectors → native css-display-none rules (pre-paint, zero flicker)")
+    print(f"  {len(native_cosmetic):,} selectors → native css-display-none rules")
 
     # ── Merge & deduplicate ───────────────────────────────────────────────────
     print("\n=== Merging and deduplicating ===")
 
-    # adblock.json: curated + upstream + native cosmetic
-    # Note: Spotify and GitHub are excluded from *cosmetic* hiding only
-    # (see COSMETIC_EXCLUDE_DOMAINS). Network-level ad/tracker blocking still
-    # applies on those domains — only element hiding is skipped.
     adblock_merged = dedup(fixed_adblock + adblock_blocks + native_cosmetic)
     trackers_merged = dedup(fixed_trackers + tracker_blocks)
-    exceptions_merged = dedup(all_exceptions)
 
+    # Add safe-site exceptions (Google Workspace, DownDetector, etc.)
+    safe_exceptions = safe_site_exceptions()
+    print(f"  Generated {len(safe_exceptions)} safe-site exception rules")
+    exceptions_merged = dedup(all_exceptions + safe_exceptions)
+
+    # Strip YouTube block rules (ytadblock.js handles YT ad blocking instead).
+    # BUT keep YouTube exception rules — they prevent YouTube's own CDN
+    # (googlevideo.com, ytimg.com) from being caught by broad upstream rules.
     adblock_merged = strip_yt_rules(adblock_merged)
     trackers_merged = strip_yt_rules(trackers_merged)
-    exceptions_merged = strip_yt_rules(exceptions_merged)
+    # Do NOT strip YT from exceptions_merged — those protect YouTube.
 
-    total = len(adblock_merged) + len(trackers_merged) + len(exceptions_merged)
-    print(f"  adblock    : {len(adblock_merged):,} rules (incl. {len(native_cosmetic):,} cosmetic)")
-    print(f"  trackers   : {len(trackers_merged):,} rules")
-    print(f"  exceptions : {len(exceptions_merged):,} rules")
+    # ── Append exceptions to the END of block lists ──────────────────────────
+    # WKContentRuleList ignore-previous-rules overrides block rules that
+    # appear earlier in the same compiled list. By appending here, the
+    # exceptions work without requiring a third rule-list file to be loaded.
+    adblock_merged = adblock_merged + exceptions_merged
+    trackers_merged = trackers_merged + exceptions_merged
+
+    total = len(adblock_merged) + len(trackers_merged)
+    print(f"  adblock    : {len(adblock_merged):,} rules (incl. {len(native_cosmetic):,} cosmetic + {len(exceptions_merged):,} exceptions)")
+    print(f"  trackers   : {len(trackers_merged):,} rules (incl. {len(exceptions_merged):,} exceptions)")
     print(f"  total      : {total:,} rules")
 
-    # ── Drop blanket main-domain blocks (upstream list false-positives) ──────
+    # ── Drop blanket main-domain blocks ──────────────────────────────────────
     print("\n=== Dropping blanket main-domain blocks ===")
     adblock_merged = drop_main_domain_blocks(adblock_merged)
     trackers_merged = drop_main_domain_blocks(trackers_merged)
 
-    # ── Sanitize: enforce WebKit single-condition-per-trigger constraint ──────
+    # ── Sanitize ─────────────────────────────────────────────────────────────
     print("\n=== Sanitizing rules (WebKit constraint) ===")
     adblock_merged = sanitize_rules(adblock_merged)
     trackers_merged = sanitize_rules(trackers_merged)
     exceptions_merged = sanitize_rules(exceptions_merged)
 
-    # ── Write JSON outputs (with auto-split) ──────────────────────────────────
+    # ── Write JSON outputs ────────────────────────────────────────────────────
     print("\n=== Writing output files ===")
 
     write_rules_auto_split(adblock_merged, "adblock", OUTPUT_DIR, ROOT)
     write_rules_auto_split(trackers_merged, "trackers", OUTPUT_DIR, ROOT)
+    # exceptions are already appended to adblock + trackers above,
+    # but also write standalone for browsers that load a third list.
     write_rules_auto_split(exceptions_merged, "exceptions", OUTPUT_DIR, ROOT)
 
-    # ── Build cosmetic.js (JS fallback for complex selectors) ─────────────────
-    # Native css-display-none handles most selectors. cosmetic.js handles
-    # the rest: anti-adblock stubs, :has-text(), and selectors too complex
-    # for the native engine (compound selectors with commas, iframe[src]).
+    # ── Build cosmetic.js ─────────────────────────────────────────────────────
     has_text_filters = extract_has_text_filters(raw)
-    # Only keep selectors that didn't make it into native rules
     js_only_selectors = [s for s in cosmetic_selectors
                          if "," in s or "::" in s or "iframe[src" in s]
     print(f"  {len(js_only_selectors):,} complex selectors → cosmetic.js (JS fallback)")
