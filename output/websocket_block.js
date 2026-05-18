@@ -4,21 +4,21 @@
 (function () {
   'use strict';
 
-  // ── Domain guard: skip on safe domains ──────────────────────────────────
   var _wsHost = window.location.hostname;
   if (/\.(google|googleapis|gstatic)\.com$/.test(_wsHost) ||
-      /downdetector\.com$/.test(_wsHost)) {
+      /downdetector\.com$/.test(_wsHost) ||
+      /^(www\.|m\.|music\.|tv\.)?youtube\.com$/.test(_wsHost) ||
+      /^(www\.)?youtubekids\.com$/.test(_wsHost) ||
+      /\.statcounter\.com$/.test(_wsHost) ||
+      /\.(kahoot\.it|kahoot\.com)$/.test(_wsHost)) {
     return;
   }
 
-  // ── Nativize helper ───────────────────────────────────────────────────
   function nativize(wrapper, original) {
     var nativeStr = 'function ' + (original.name || '') + '() { [native code] }';
     wrapper.toString = function () { return nativeStr; };
     return wrapper;
   }
-
-  // ── WebSocket blocking ────────────────────────────────────────────────
 
   var _WS = window.WebSocket;
   var BLOCKED_WS = [
@@ -56,14 +56,10 @@
   window.WebSocket.CLOSING = 2;
   window.WebSocket.CLOSED = 3;
 
-  // ── WebRTC IP leak prevention ─────────────────────────────────────────
-
   var _RTC = window.RTCPeerConnection || window.webkitRTCPeerConnection;
   if (_RTC) {
     var _rtcWrapper = function (config, constraints) {
-      if (config && config.iceServers) {
-        config.iceServers = [];
-      }
+      if (config && config.iceServers) { config.iceServers = []; }
       return new _RTC(config, constraints);
     };
     window.RTCPeerConnection = nativize(_rtcWrapper, _RTC);
@@ -72,11 +68,6 @@
       window.webkitRTCPeerConnection = window.RTCPeerConnection;
     }
   }
-
-  // ── navigator.sendBeacon blocking ─────────────────────────────────────
-  // NARROWED in v3.1: Only block beacons to known third-party tracker
-  // domains. Previous patterns (/analytics/i, /collect/i, /pixel/i,
-  // /beacon/i) were too broad and broke Google Workspace.
 
   var _beacon = navigator.sendBeacon;
   var BLOCKED_BEACON = [
