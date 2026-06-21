@@ -1,9 +1,9 @@
-! Checksum: FN2Mfl+q6731ek+Y++xeZw
-! Diff-Path: ../patches/17/17-s-1780665189-3600.patch
+! Checksum: hsh6ap5ZamQqKpjgqRYoLA
+! Diff-Path: ../patches/17/17-s-1781869210-3600.patch
 ! Title: AdGuard URL Tracking filter
 ! Description: Filter that enhances privacy by removing tracking parameters from URLs.
-! Version: 2.0.13.46
-! TimeUpdated: 2026-06-05T13:10:38+00:00
+! Version: 2.0.13.54
+! TimeUpdated: 2026-06-19T11:37:44+00:00
 ! Expires: 5 days (update frequency)
 ! Homepage: https://github.com/AdguardTeam/AdGuardFilters
 ! License: https://github.com/AdguardTeam/AdguardFilters/blob/master/LICENSE
@@ -22,6 +22,8 @@
 !
 ! NOTE: Generic rules
 !
+! https://github.com/DandelionSprout/adfilt/discussions/163#discussioncomment-17285759
+$removeparam=/^weekend-reading-link-\d{6}$/
 ! Not identified. Used on avira.com, malwarebytes.com and some other sites
 ! https://urlscan.io/search/#page.url%3A%22x-clickref%3D%22
 $removeparam=x-clickref
@@ -529,6 +531,22 @@ $removeparam=tduid
 ! Bad: ||example.org^$xmlhttprequest,redirect=noopvast-3.0 (for instance, should be in specific.txt)
 !
 !
+! https://github.com/AdguardTeam/AdguardFilters/issues/233902
+||owlclick.com^$removeparam=source
+||owlclick.com^$removeparam=campaign_id
+! https://github.com/AdguardTeam/AdguardFilters/issues/233491
+||github.com^$removeparam=email_source
+||github.com^$removeparam=email_token
+! https://github.com/AdguardTeam/AdguardFilters/issues/233679
+||pages.tmall.com^$removeparam=tkSid
+||pages.tmall.com^$removeparam=xMktId
+! vhttps://github.com/DandelionSprout/adfilt/discussions/163#discussioncomment-17271132
+||theepochtimes.com^$removeparam=ea_med
+||theepochtimes.com^$removeparam=ea_src
+! oricon.co.jp/special/75147/?ref_cd=oriconrecommend4
+||oricon.co.jp^$removeparam=ref_cd
+! https://github.com/DandelionSprout/adfilt/discussions/163#discussioncomment-17218658
+||adguard-dns.io^$removeparam=clid
 ! https://github.com/DandelionSprout/adfilt/discussions/163#discussioncomment-17186101
 ||chexy.co^$removeparam=_caid
 ||chexy.co^$removeparam=_cvid
@@ -999,6 +1017,8 @@ $removeparam=s-id,domain=item.rakuten.co.jp|www.rakuten.co.jp
 ||gettranny.com^$removeparam=campaign
 ! https://github.com/AdguardTeam/AdguardFilters/issues/206757
 ||stanby.com^$removeparam=sr_fr
+! https://github.com/DandelionSprout/adfilt/discussions/163#discussioncomment-17323034
+||youtu.be^$removeparam=is
 ! https://github.com/uBlockOrigin/uAssets/issues/30157#issuecomment-3394225990
 ! https://github.com/DandelionSprout/adfilt/discussions/163#discussioncomment-13326533
 ||youtube.com/shorts/$removeparam=si
@@ -1705,8 +1725,6 @@ $removeparam=from,domain=doujinnomori.com|shinshi-manga.net|echiman.com|dojin-na
 ||zapiska.substack.com^$removeparam=publication_id
 ||zapiska.substack.com^$removeparam=post_id
 ||zapiska.substack.com^$removeparam=r
-! https://github.com/AdguardTeam/AdguardFilters/issues/173471
-||youtu.be^$removeparam=si
 ! https://github.com/AdguardTeam/AdguardFilters/issues/173807
 ||eplus.by^$removeparam=de_utm_source
 ! https://github.com/AdguardTeam/AdguardFilters/issues/173600
@@ -2825,7 +2843,6 @@ $removeparam=union_lens,domain=tmall.com|taobao.com
 ||aliexpress.$removeparam=pdp_npi
 ||aliexpress.$removeparam=aff_trace_key
 ||aliexpress.$removeparam=aff_platform
-||aliexpress.$removeparam=aff_short_key
 ||aliexpress.$removeparam=spm
 ||aliexpress.$removeparam=scm
 ||aliexpress.$removeparam=scm_id
@@ -2838,6 +2855,10 @@ $removeparam=union_lens,domain=tmall.com|taobao.com
 ||aliexpress.$removeparam=pvid
 ||aliexpress.$removeparam=dp
 ||aliexpress.$removeparam=sk
+! https://github.com/AdguardTeam/AdguardFilters/issues/233869
+! TODO: Remove platform restriction when MV3 supports allowlist rules for $removeparam
+!+ NOT_PLATFORM(ext_chromium_mv3)
+||aliexpress.$removeparam=aff_short_key
 ! https://github.com/AdguardTeam/AdguardFilters/issues/108478
 ||agoda.com^$removeparam=tag
 ! https://github.com/AdguardTeam/AdguardFilters/issues/106186
